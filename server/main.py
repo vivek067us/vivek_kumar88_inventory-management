@@ -120,6 +120,30 @@ class CreatePurchaseOrderRequest(BaseModel):
     expected_delivery_date: str
     notes: Optional[str] = None
 
+class RestockingRecommendation(BaseModel):
+    item_id: str
+    sku: str
+    name: str
+    current_stock: int
+    forecasted_demand: int
+    demand_gap: int
+    quantity_to_order: int
+    unit_cost: float
+    total_cost: float
+    warehouse: str
+    category: str
+
+class RestockingRecommendationsResponse(BaseModel):
+    budget: float
+    recommendations: List[RestockingRecommendation]
+    total_cost: float
+    budget_remaining: float
+
+class CreateRestockingOrderRequest(BaseModel):
+    items: List[dict]  # List of items to restock
+    total_value: float
+    warehouse: str
+
 # API endpoints
 @app.get("/")
 def root():
@@ -303,6 +327,151 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restocking/recommendations", response_model=RestockingRecommendationsResponse)
+def get_restocking_recommendations(budget: float):
+    """Get restocking recommendations based on budget and demand forecasts"""
+    import random
+    from datetime import datetime
+
+    recommendations = []
+
+    # Build a map of SKU to inventory item
+    inventory_map = {item['sku']: item for item in inventory_items}
+
+    # Calculate demand gaps and match with inventory
+    candidates = []
+    for forecast in demand_forecasts:
+        sku = forecast['item_sku']
+        if sku in inventory_map:
+            inv_item = inventory_map[sku]
+            demand_gap = forecast['forecasted_demand'] - forecast['current_demand']
+
+            # Only consider items with positive demand gap (increasing demand)
+            if demand_gap > 0:
+                candidates.append({
+                    'item_id': inv_item['id'],
+                    'sku': sku,
+                    'name': inv_item['name'],
+                    'current_stock': inv_item['quantity_on_hand'],
+                    'forecasted_demand': forecast['forecasted_demand'],
+                    'demand_gap': demand_gap,
+                    'unit_cost': inv_item['unit_cost'],
+                    'warehouse': inv_item['warehouse'],
+                    'category': inv_item['category']
+                })
+
+    # Sort by highest demand gap (priority: highest demand increase)
+    candidates.sort(key=lambda x: x['demand_gap'], reverse=True)
+
+    # Allocate budget to items
+    remaining_budget = budget
+    total_cost = 0.0
+
+    for candidate in candidates:
+        # Calculate how many units to order (match the demand gap)
+        quantity_to_order = candidate['demand_gap']
+        item_total_cost = quantity_to_order * candidate['unit_cost']
+
+        # Check if we can afford this item
+        if item_total_cost <= remaining_budget:
+            recommendations.append(RestockingRecommendation(
+                item_id=candidate['item_id'],
+                sku=candidate['sku'],
+                name=candidate['name'],
+                current_stock=candidate['current_stock'],
+                forecasted_demand=candidate['forecasted_demand'],
+                demand_gap=candidate['demand_gap'],
+                quantity_to_order=quantity_to_order,
+                unit_cost=candidate['unit_cost'],
+                total_cost=round(item_total_cost, 2),
+                warehouse=candidate['warehouse'],
+                category=candidate['category']
+            ))
+            remaining_budget -= item_total_cost
+            total_cost += item_total_cost
+        elif remaining_budget > candidate['unit_cost']:
+            # Partial order: buy as many as budget allows
+            affordable_quantity = int(remaining_budget / candidate['unit_cost'])
+            item_total_cost = affordable_quantity * candidate['unit_cost']
+
+            if affordable_quantity > 0:
+                recommendations.append(RestockingRecommendation(
+                    item_id=candidate['item_id'],
+                    sku=candidate['sku'],
+                    name=candidate['name'],
+                    current_stock=candidate['current_stock'],
+                    forecasted_demand=candidate['forecasted_demand'],
+                    demand_gap=candidate['demand_gap'],
+                    quantity_to_order=affordable_quantity,
+                    unit_cost=candidate['unit_cost'],
+                    total_cost=round(item_total_cost, 2),
+                    warehouse=candidate['warehouse'],
+                    category=candidate['category']
+                ))
+                remaining_budget -= item_total_cost
+                total_cost += item_total_cost
+
+    return RestockingRecommendationsResponse(
+        budget=budget,
+        recommendations=recommendations,
+        total_cost=round(total_cost, 2),
+        budget_remaining=round(remaining_budget, 2)
+    )
+
+@app.post("/api/restocking/orders")
+def create_restocking_order(order_request: CreateRestockingOrderRequest):
+    """Create a new restocking order"""
+    import random
+    from datetime import datetime, timedelta
+
+    # Generate order ID and number
+    order_id = f"RST-{len(orders) + 1}"
+    order_number = f"RST-{datetime.now().strftime('%Y%m%d')}-{random.randint(1000, 9999)}"
+
+    # Calculate expected delivery date based on warehouse
+    today = datetime.now()
+    warehouse = order_request.warehouse
+
+    # Warehouse-based lead times
+    if warehouse == "San Francisco":
+        lead_days = random.randint(3, 5)
+    elif warehouse == "London":
+        lead_days = random.randint(5, 7)
+    elif warehouse == "Tokyo":
+        lead_days = random.randint(7, 10)
+    else:
+        lead_days = 7  # Default
+
+    expected_delivery = (today + timedelta(days=lead_days)).strftime('%Y-%m-%d')
+    order_date = today.strftime('%Y-%m-%d')
+
+    # Create the new order
+    new_order = {
+        "id": order_id,
+        "order_number": order_number,
+        "customer": "Internal Restocking",
+        "items": order_request.items,
+        "status": "Restocking",
+        "order_date": order_date,
+        "expected_delivery": expected_delivery,
+        "total_value": order_request.total_value,
+        "actual_delivery": None,
+        "warehouse": warehouse,
+        "category": "Multiple"  # Restocking orders typically have multiple categories
+    }
+
+    # Add to orders list
+    orders.append(new_order)
+
+    return {
+        "success": True,
+        "order_id": order_id,
+        "order_number": order_number,
+        "expected_delivery": expected_delivery,
+        "lead_days": lead_days,
+        "message": f"Restocking order created successfully. Expected delivery in {lead_days} days."
+    }
 
 if __name__ == "__main__":
     import uvicorn
